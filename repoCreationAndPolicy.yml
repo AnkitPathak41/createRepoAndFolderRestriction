@@ -1,0 +1,85 @@
+# https://aka.ms/yaml
+
+trigger: none
+
+variables:
+- name: organization
+  value: $(System.CollectionUri)
+-name: project
+  value: $(System.TeamProject)
+
+Parameters:
+  - name: RepoName
+    type: string
+    displayName: Enter the name of the repo you want to create
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+- bash: az --version
+  displayName: 'Show Azure CLI version'
+
+- bash: echo ${AZURE_DEVOPS_CLI_PAT} | az devops login
+  env:
+    AZURE_DEVOPS_CLI_PAT: $(system.accesstoken)
+  displayName: 'Login Azure DevOps Extension'
+
+- bash: az devops configure --defaults organization=$(System.TeamFoundationCollectionUri) project=$(System.TeamProject) --use-git-aliases true
+  displayName: 'Set default Azure DevOps organization and project'
+
+- bash: |
+    az pipelines build list
+    git pr list
+  displayName: 'Show build list and PRs'
+ 
+- task: PowerShell@2
+  inputs:
+    targetType: 'inline'
+    script: |
+    
+      #Check repo existance
+                $repoList = az repos list --org $(organization) -p $(project) --query "[].name" -o tsv      
+                $repoCollection = [Collections.Generic.List[Object]]$repoList 
+                Write-Host $repoList
+                if ($repoCollection -and $repoCollection.FindIndex({ $args[0] -eq '$(RepoName)' }) -ge 0) {
+                    Write-Host "Repo already exists"
+                } else {
+                    Write-Host "Creating repo"
+                  #Create Repositories
+                  az repos create --name $(RepoName) --org $(organization) --project $(project) 
+                }
+                #Create descriptor for contributors
+                $descriptorContributor = az devops security group list --org $(organization) --project $(project) | ConvertFrom-Json | select -expand graphGroups | where principalName -eq "[$(project)]\Contributors"
+                $descriptorAdministrator = az devops security group list --org $(organization) --project $(project) | ConvertFrom-Json | select -expand graphGroups | where principalName -eq "[$(project)]\Project Administrators" 
+                #Create the tokens
+                function hexify($string) {
+                    return ($string | Format-Hex -Encoding Unicode | Select-Object -Expand Bytes | ForEach-Object { '{0:x2}' -f $_ }) -join ''
+                }
+                
+                #Create hex string for feature
+                $hexFeatureBranch = hexify -string  "feature"
+                $featureToken = "refs/heads/$hexFeatureBranch"
+                #Create hex string for Bug
+                $hexBugBranch = hexify -string  "bug"
+                $bugToken = "refs/heads/$hexBugBranch"
+                #Create hex string for main/master
+                $hexMainBranch = hexify -string "main"
+                $mainToken = "refs/heads/main"
+                #Create Namespace ID
+                $namespaceId = az devops security permission namespace list --org $(organization)/ --query "[?@.name == 'Git Repositories'].namespaceId | [0]"
+                #Project ID
+                $projectObj = az devops project show --org $(organization) --project $(project) | ConvertFrom-Json
+                $projectid = $projectObj.id
+                #Deny permission on all branch at root level
+                $denyBranch = az devops security permission update --id $namespaceId --org $(organization) --subject $descriptorContributor.descriptor --token "repoV2/$projectid/$repoId" --deny-bit 16 --allow-bit 16494
+                #Get repo Id
+                $repoId = az repos show -r $(RepoName) -p $(project) --org $(organization) --query "id" -o tsv
+                $featureTokenBuild = "repoV2/$projectid/$repoId/$featureToken"
+                $bugTokenBuild = "repoV2/$projectid/$repoId/$bugToken"
+                $mainTokenBuild = "repoV2/$projectid/$repoId/$mainToken"
+                #Allow feature and bug branch 
+                $allowCreateBranchFeature = az devops security permission update --id $namespaceId --org $(organization) --subject $descriptorContributor.descriptor --token $featureTokenBuild --deny-bit 0 --allow-bit 16
+                $allowCreateBranchBug = az devops security permission update --id $namespaceId --org $(organization) --subject $descriptorContributor.descriptor --token $bugTokenBuild --deny-bit 0 --allow-bit 16
+                #Allow admin to recreate main/master
+                $allowCreateBranchBug = az devops security permission update --id $namespaceId --org $(organization) --subject $descriptorAdministrator.descriptor --token $mainTokenBuild --deny-bit 0 --allow-bit 16
